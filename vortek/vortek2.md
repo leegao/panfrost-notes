@@ -63,17 +63,275 @@ typedef struct VtContext {
 
 ## VT Handlers
 
-### Overview
+### Architectural Overview
 
-These `vt_handle_vk...` functions are part of a command processing loop in a custom Vulkan renderer layer or wrapper. They serve as the server-side handlers for Vulkan API calls initiated by a client process. Their general structure involves:
+The `libvortekrenderer2.so` library acts as a server-side Vulkan wrapper. It receives serialized commands from a client, deserializes them, executes them against the native Vulkan driver, and serializes results back. The modifications can be categorized into several key architectural patterns:
 
-1.  **Deserialization:** Reading function arguments from a command buffer (`context->inputBufferPtr`).
-2.  **Handle Resolution:** Converting opaque IDs from the client into valid Vulkan handles using `VkObject_fromId`.
-3.  **Modification/Hooking:** Intercepting the call to perform custom logic, such as format emulation, custom memory management, or synchronization.
-4.  **Dispatch:** Calling the actual Vulkan function pointer loaded from the driver (`dispatch_vk...`).
-5.  **Serialization:** Writing the `VkResult` and any output data back to the client via a ring buffer (`context->clientRingBuffer`).
+1.  **Standard Pass-through:** The vast majority of functions are simple wrappers. They deserialize arguments, resolve handle IDs (e.g., `VkObject_fromId`), call the corresponding function in the Vulkan dispatch table (e.g., `dispatch_vkCmdDraw`), and, if necessary, serialize the result. They contain no modifications to the API's behavior.
+2.  **Custom Swapchain (`XWindowSwapchain_...`)**: This is a major modification. The wrapper completely bypasses the standard `VK_KHR_swapchain` extension. It implements its own swapchain logic, likely using Android's `Surface` and `AHardwareBuffer` for direct presentation control, better performance, and integration with the Android compositor.
+3.  **Texture Decompression (`TextureDecoder_...`)**: The renderer emulates support for compressed texture formats (like BCn/DXT) that may not be available on the host GPU. It hooks `vkCreateImage`, `vkCmdCopyBufferToImage`, and other related functions to manage these textures. When an application tries to use a compressed texture, the renderer creates an uncompressed backing image and uses a custom decoder to handle the data on the fly.
+4.  **Asynchronous Operations (`AsyncPipelineCreator`, `TimelineSemaphore_asyncWait`)**: To prevent the main renderer thread from stalling on long-running, blocking operations, the wrapper offloads them to worker threads. This is used for:
+    *   **Pipeline Compilation:** `vkCreateGraphicsPipelines` and `vkCreateComputePipelines` are handled by the `AsyncPipelineCreator`.
+    *   **Semaphore/Fence Waiting:** `vkWaitSemaphores` and `vkWaitForFences` are replaced with non-blocking IPC mechanisms that use `eventfd` and `sendmsg` to let the client perform the wait.
+5.  **Shader Analysis (`ShaderInspector_...`)**: The wrapper intercepts shader creation (`vkCreateShaderModule`) and related queries (`vkGetShaderModuleCreateInfoIdentifierEXT`) to parse the SPIR-V bytecode. This allows it to extract metadata about the shader's resource usage without needing to fully compile a pipeline, which can be used for validation or optimization.
+6.  **Custom Memory Management (`ResourceMemory_...`)**: To facilitate sharing memory between the client and the renderer server, the wrapper hooks `vkAllocateMemory` and `vkMapMemory`. It uses Android-specific heaps like ION or DMA-BUF to create shareable memory allocations and passes file descriptors (`fd`) back to the client via `sendmsg`.
+7.  **Minor Hooks**: Small, targeted modifications to parameters, such as adding the `VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT` to push constant ranges to simplify shader development for the client.
 
----
+### TLDR Function Table
+
+| Vulkan Function | Pre-Dispatch Modification? | Post-Dispatch Modification? | Interesting Downstream Calls | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `vkCreateInstance` | **Yes** | No | `initVulkanInstance` | **Major Hook.** Injects required instance extensions (`VK_KHR_surface`, `VK_KHR_xlib_surface`, etc.) and initializes the instance-level dispatch table. |
+| `vkDestroyInstance` | **No** | No | | Standard pass-through. |
+| `vkEnumeratePhysicalDevices` | **No** | No | | Standard pass-through. |
+| `vkGetPhysicalDeviceProperties` | No | **Yes** | `checkDeviceProperties` | **Minor Hook.** Overwrites the device name with "Vortek (%s)" and may adjust other reported properties. |
+| `vkGetPhysicalDeviceQueueFamilyProperties` | **No** | No | | Standard pass-through. |
+| `vkGetPhysicalDeviceMemoryProperties`| **Yes** | No | `overrideMemoryHeapSize` | **Minor Hook.** Modifies the reported memory heap sizes, likely capping them to a value provided by the client (`maxDeviceMemory`). |
+| `vkGetPhysicalDeviceFeatures`| **Yes** | No | `checkDeviceFeatures` | **Minor Hook.** Enables or disables certain device features (e.g., forces `shaderClipDistance`, `samplerAnisotropy` to true). |
+| `vkGetPhysicalDeviceFormatProperties`| **Yes** | No | `checkFormatProperties` | **Hook.** If a compressed format is queried and not supported, it fakes support by returning the properties of an uncompressed format (`VK_FORMAT_B8G8R8A8_UNORM`). |
+| `vkGetPhysicalDeviceImageFormatProperties`| **Yes** | No | `isCompressedFormat`, `getCompressedImageFormatProperties` | **Hook.** Fakes support for compressed formats by returning predefined properties if the driver reports `VK_ERROR_FORMAT_NOT_SUPPORTED`. |
+| `vkCreateDevice` | **Yes** | **Yes** | `disableUnsupportedDeviceFeatures`, `initVulkanDevice` | **Major Hook.** Disables features not supported by the wrapper. Injects required device extensions (`VK_KHR_swapchain`, external memory extensions, etc.). Initializes the device-level dispatch table. |
+| `vkDestroyDevice` | **No** | No | | Standard pass-through. |
+| `vkEnumerateInstanceVersion`| **No** | No | | Standard pass-through. |
+| `vkEnumerateInstanceExtensionProperties`| **Yes** | No | `injectExtensions2` | **Hook.** Injects `VK_KHR_surface`, `VK_KHR_android_surface`, and `VK_KHR_xlib_surface` into the reported list of supported extensions. |
+| `vkEnumerateDeviceExtensionProperties`| **Yes** | No | `getExposedDeviceExtensionProperties` | **Hook.** Filters the driver's supported extensions against a custom list of "exposed" extensions, hiding unsupported or problematic ones from the client. |
+| `vkGetDeviceQueue` | **No** | No | | Standard pass-through. |
+| `vkQueueSubmit` | **Yes** | No | `TextureDecoder_decodeAll` | **Major Hook.** Before submitting work, it ensures all pending texture decompressions are completed to prevent race conditions. |
+| `vkQueueWaitIdle` | **No** | No | | Standard pass-through. |
+| `vkDeviceWaitIdle` | **No** | No | | Standard pass-through. |
+| `vkAllocateMemory` | **Yes** | N/A (dispatch is inside) | `ResourceMemory_allocate` | **Major Hook.** Intercepts memory allocation to use Android-specific shared memory (ION, DMA-BUF) for host-visible memory types. |
+| `vkFreeMemory` | **Yes** | N/A (dispatch is inside) | `ResourceMemory_free` | **Major Hook.** Calls a custom deallocator to properly clean up shared memory resources (FDs, AHardwareBuffers). |
+| `vkMapMemory` | **Yes** | N/A (dispatch bypassed) | `sendmsg` | **IPC Hook.** Bypasses `vkMapMemory`. Instead, sends the file descriptor of the shared memory allocation to the client via a socket message. |
+| `vkUnmapMemory` | **Yes** | N/A (dispatch bypassed) | | **Stubbed.** The function is a no-op that logs "not implemented yet". Unmapping is the client's responsibility. |
+| `vkFlushMappedMemoryRanges`| **Yes** | No | | **Minor Hook.** Uses a conditional check (`vortekSerializerCastVkObject`) to determine how to resolve the `VkDeviceMemory` handle from a custom wrapper object. |
+| `vkInvalidateMappedMemoryRanges`| **Yes** | No | | **Minor Hook.** Same conditional handle resolution logic as `vkFlushMappedMemoryRanges`. |
+| `vkGetDeviceMemoryCommitment`| **No** | No | | Standard pass-through. |
+| `vkGetBufferMemoryRequirements`| **No** | No | | Standard pass-through. |
+| `vkBindBufferMemory` | **No** | **Yes** | `TextureDecoder_addBoundBuffer` | **Hook.** After a successful binding, it registers the buffer-memory pair with the texture decoder for future reference during decompression. |
+| `vkGetImageMemoryRequirements`| **No** | No | | Standard pass-through. |
+| `vkBindImageMemory` | **No** | No | | Standard pass-through. No hook for the texture decoder here. |
+|`vkGetImageSparseMemoryRequirements`|**No**|No||Standard pass-through query. |
+|`vkGetPhysicalDeviceSparseImageFormatProperties`|**No**|No||Standard pass-through query. |
+| `vkQueueBindSparse` | **No** | No | | Standard pass-through. Handles extremely complex deserialization but does not modify the data. |
+| `vkCreateFence` | **No** | No | | Standard pass-through. |
+| `vkDestroyFence` | **No** | No | | Standard pass-through. |
+| `vkResetFences` | **No** | No | | Standard pass-through. |
+| `vkGetFenceStatus` | **No** | No | | Standard pass-through. |
+| `vkWaitForFences` | **Yes** | N/A (dispatch bypassed) | `dispatch_vkGetFenceFd`, `sendmsg` | **IPC Hook.** Bypasses the blocking wait. Gets file descriptors for the fences and sends them to the client for asynchronous waiting. |
+| `vkCreateSemaphore` | **No** | No | | Standard pass-through. |
+| `vkDestroySemaphore` | **No** | No | | Standard pass-through. |
+| `vkCreateEvent` | **No** | No | | Standard pass-through. |
+| `vkDestroyEvent` | **No** | No | | Standard pass-through. |
+| `vkGetEventStatus` | **No** | No | | Standard pass-through. |
+| `vkSetEvent` | **No** | No | | Standard pass-through. |
+| `vkResetEvent` | **No** | No | | Standard pass-through. |
+| `vkCreateQueryPool` | **No** | No | | Standard pass-through. |
+| `vkDestroyQueryPool` | **No** | No | | Standard pass-through. |
+| `vkGetQueryPoolResults` | **No** | No | | Standard pass-through. Handles data serialization. |
+| `vkResetQueryPool` | **No** | No | | (Device-level version) Standard pass-through. |
+| `vkCreateBuffer` | **No** | No | | Standard pass-through. |
+| `vkDestroyBuffer` | **No** | **Yes** | `TextureDecoder_removeBoundBuffer` | **Hook.** Before destroying the buffer, it un-registers it from the texture decoder to clean up tracking data. |
+| `vkCreateBufferView` | **No** | No | | Standard pass-through. |
+| `vkDestroyBufferView` | **No** | No | | Standard pass-through. |
+| `vkCreateImage` | **Yes** | N/A (dispatch replaced)| `TextureDecoder_createImage` | **Major Hook.** If the format is compressed, it uses a custom function to create an uncompressed backing image for emulation. |
+| `vkDestroyImage` | **Yes** | N/A (dispatch bypassed)| `TextureDecoder_destroyImage` | **Hook.** If the image is managed by the decoder, it calls a custom destroy function to clean up associated resources. |
+| `vkGetImageSubresourceLayout`| **No** | No | | Standard pass-through. |
+| `vkCreateImageView` | **Yes** | No | | **Hook.** Modifies `VkImageViewCreateInfo` to use an uncompressed format if the source image is an emulated compressed texture. |
+| `vkDestroyImageView` | **No** | No | | Standard pass-through. |
+| `vkCreateShaderModule` | **Yes** | N/A (dispatch is inside)| `ShaderInspector_createModule` | **Hook.** Intercepts shader creation to parse SPIR-V and store metadata in a custom wrapper object. |
+| `vkDestroyShaderModule` | **Yes** | N/A (dispatch is inside)| | **Hook.** Frees the custom wrapper object and its associated data before destroying the Vulkan handle. |
+| `vkCreatePipelineCache` | **No** | No | | Standard pass-through. |
+| `vkDestroyPipelineCache` | **No** | No | | Standard pass-through. |
+| `vkGetPipelineCacheData` | **No** | No | | Standard pass-through. |
+| `vkMergePipelineCaches` | **No** | No | | Standard pass-through. |
+| `vkCreateGraphicsPipelines`| **Yes** | N/A (dispatch is async)| `AsyncPipelineCreator_create` | **Major Hook.** Offloads pipeline creation to a worker thread to avoid stalling. |
+| `vkCreateComputePipelines` | **Yes** | N/A (dispatch is async)| `AsyncPipelineCreator_create` | **Major Hook.** Offloads pipeline creation to a worker thread. |
+| `vkDestroyPipeline` | **No** | No | | Standard pass-through. |
+| `vkCreatePipelineLayout` | **Yes** | No | | **Minor Hook.** Modifies `stageFlags` in `VkPushConstantRange` to automatically include the tessellation stage if the vertex stage is present. |
+| `vkDestroyPipelineLayout`| **No** | No | | Standard pass-through. |
+| `vkCreateSampler` | **No** | No | | Standard pass-through. |
+| `vkDestroySampler` | **No** | No | | Standard pass-through. |
+| `vkCreateDescriptorSetLayout`| **No** | No | | Standard pass-through. |
+| `vkDestroyDescriptorSetLayout`| **No** | No | | Standard pass-through. |
+| `vkCreateDescriptorPool` | **No** | No | | Standard pass-through. |
+| `vkDestroyDescriptorPool` | **No** | No | | Standard pass-through. |
+| `vkResetDescriptorPool` | **No** | No | | Standard pass-through. |
+| `vkAllocateDescriptorSets`| **No** | No | | Standard pass-through. |
+| `vkFreeDescriptorSets` | **No** | No | | Standard pass-through. |
+| `vkUpdateDescriptorSets` | **No** | No | | Standard pass-through. |
+| `vkCreateFramebuffer` | **No** | No | | Standard pass-through. |
+| `vkDestroyFramebuffer` | **No** | No | | Standard pass-through. |
+| `vkCreateRenderPass` | **No** | No | | Standard pass-through. |
+| `vkDestroyRenderPass` | **No** | No | | Standard pass-through. |
+| `vkGetRenderAreaGranularity`| **No** | No | | Standard pass-through. |
+| `vkCreateCommandPool` | **No** | No | | Standard pass-through. |
+| `vkDestroyCommandPool` | **No** | No | | Standard pass-through. |
+| `vkResetCommandPool` | **No** | No | | Standard pass-through. |
+| `vkAllocateCommandBuffers`| **No** | No | | Standard pass-through. |
+| `vkFreeCommandBuffers` | **No** | No | | Standard pass-through. |
+| `vkBeginCommandBuffer` | **No** | No | | Standard pass-through. |
+| `vkEndCommandBuffer` | **Yes** | No | `getHandleRequestFunc` | **Major Hook.** This command acts as a trigger to process a batch of other `vkCmd...` calls that have been serialized into its input buffer, reducing IPC overhead. |
+| `vkResetCommandBuffer` | **No** | No | | Standard pass-through. |
+| `vkCmdBindPipeline` | **Yes** | No | `AsyncPipelineCreator_getVkHandle` | **Hook.** Synchronizes with the `AsyncPipelineCreator`. If a pipeline is still being created asynchronously, this call blocks until it is finished. |
+| `vkCmdSetViewport` | **No** | No | | Standard pass-through. |
+| `vkCmdSetScissor` | **No** | No | | Standard pass-through. |
+| `vkCmdSetLineWidth` | **No** | No | | Standard pass-through. |
+| `vkCmdSetDepthBias` | **No** | No | | Standard pass-through. |
+| `vkCmdSetBlendConstants` | **No** | No | | Standard pass-through. |
+| `vkCmdSetDepthBounds` | **No** | No | | Standard pass-through. |
+| `vkCmdSetStencilCompareMask`| **No** | No | | Standard pass-through. |
+| `vkCmdSetStencilWriteMask`| **No** | No | | Standard pass-through. |
+| `vkCmdSetStencilReference`| **No** | No | | Standard pass-through. |
+| `vkCmdBindDescriptorSets`| **No** | No | | Standard pass-through. |
+| `vkCmdBindIndexBuffer` | **No** | No | | Standard pass-through. |
+| `vkCmdBindVertexBuffers` | **No** | No | | Standard pass-through. |
+| `vkCmdDraw` | **No** | No | | Standard pass-through. |
+| `vkCmdDrawIndexed` | **No** | No | | Standard pass-through. |
+| `vkCmdDrawIndirect` | **No** | No | | Standard pass-through. |
+| `vkCmdDrawIndexedIndirect`| **No** | No | | Standard pass-through. |
+| `vkCmdDispatch` | **No** | No | | Standard pass-through. |
+| `vkCmdDispatchIndirect`| **No** | No | | Standard pass-through. |
+| `vkCmdCopyBuffer` | **No** | No | | Standard pass-through. |
+| `vkCmdCopyImage` | **No** | No | | Standard pass-through. |
+| `vkCmdBlitImage` | **No** | No | | Standard pass-through. |
+| `vkCmdCopyBufferToImage` | **Yes** | N/A (dispatch may be bypassed)| `TextureDecoder_containsImage`, `TextureDecoder_copyBufferToImage` | **Hook.** Intercepts the call if `dstImage` is a known emulated texture and redirects it to the custom decoder to handle decompression. |
+| `vkCmdCopyImageToBuffer` | **Yes** | N/A (dispatch may be bypassed)| `TextureDecoder_containsImage`, `TextureDecoder_copyImageToBuffer` | **Hook.** Similar to the above, but for reading from an emulated texture. This would involve re-compressing or reading from the uncompressed backing store. |
+| `vkCmdUpdateBuffer` | **No** | No | | Standard pass-through. |
+| `vkCmdFillBuffer` | **No** | No | | Standard pass-through. |
+| `vkCmdClearColorImage` | **No** | No | | Standard pass-through. |
+| `vkCmdClearDepthStencilImage` | **No** | No | | Standard pass-through. |
+| `vkCmdClearAttachments` | **No** | No | | Standard pass-through. |
+| `vkCmdResolveImage` | **No** | No | | Standard pass-through. |
+| `vkCmdSetEvent` | **No** | No | | Standard pass-through. |
+| `vkCmdResetEvent` | **No** | No | | Standard pass-through. |
+| `vkCmdWaitEvents` | **No** | No | | Standard pass-through. |
+| `vkCmdPipelineBarrier` | **No** | No | | Standard pass-through. |
+| `vkCmdBeginQuery` | **No** | No | | Standard pass-through. |
+| `vkCmdEndQuery` | **No** | No | | Standard pass-through. |
+| `vkCmdBeginConditionalRenderingEXT` | **No** | No | | Standard pass-through. |
+| `vkCmdEndConditionalRenderingEXT`| **No** | No | | Standard pass-through. |
+| `vkCmdResetQueryPool` | **No** | No | | Standard pass-through. |
+| `vkCmdWriteTimestamp` | **No** | No | | Standard pass-through. |
+| `vkCmdCopyQueryPoolResults`| **No** | No | | Standard pass-through. |
+| `vkCmdPushConstants` | **Yes** | No | | **Minor Hook.** Modifies `stageFlags` to automatically include the tessellation stage if the vertex stage is present. |
+| `vkCmdBeginRenderPass` | **No** | No | | Standard pass-through. |
+| `vkCmdNextSubpass` | **No** | No | | Standard pass-through. |
+| `vkCmdEndRenderPass` | **No** | No | | Standard pass-through. |
+| `vkCmdExecuteCommands` | **No** | No | | Standard pass-through. |
+| `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`| **Yes** | N/A (dispatch bypassed)| `getWindowExtent` | **Major Hook.** Bypasses the driver. Returns capabilities based on the Android window, faking values like `minImageCount` to 1. |
+| `vkGetPhysicalDeviceSurfaceFormatsKHR`| **Yes** | N/A (dispatch bypassed)| `getSurfaceFormats` | **Major Hook.** Bypasses the driver. Returns a hardcoded list of supported surface formats (`VK_FORMAT_B8G8R8A8_UNORM`, etc.). |
+| `vkGetPhysicalDeviceSurfacePresentModesKHR`| **Yes** | N/A (dispatch bypassed)| | **Major Hook.** Bypasses the driver. Returns a hardcoded list of present modes (e.g., `VK_PRESENT_MODE_FIFO_KHR`). |
+| `vkCreateSwapchainKHR` | **Yes** | N/A (dispatch bypassed)| `XWindowSwapchain_create` | **Major Hook.** Replaces the standard swapchain with a custom one. |
+| `vkDestroySwapchainKHR` | **Yes** | N/A (dispatch bypassed)| `XWindowSwapchain_destroy` | **Hook.** Destroys the custom swapchain object. |
+| `vkGetSwapchainImagesKHR`| **Yes** | N/A (dispatch bypassed)| | **Hook.** Returns image handles from the custom swapchain object. |
+| `vkAcquireNextImageKHR` | **Yes** | N/A (dispatch bypassed)| `XWindowSwapchain_acquireNextImage` | **Hook.** Acquires an image from the custom swapchain. |
+| `vkQueuePresentKHR` | **Yes** | N/A (dispatch bypassed)| `XWindowSwapchain_presentImage` | **Hook.** Presents an image using the custom swapchain logic. |
+| `vkGetPhysicalDeviceFeatures2`| **Yes** | No | `checkDeviceFeatures` | **Minor Hook.** Same as the non-`2` version; forces certain features to be enabled. |
+|`vkGetPhysicalDeviceProperties2`| **Yes** | No | `checkDeviceProperties` | **Minor Hook.** Same as the non-`2` version; overwrites device name and properties. |
+|`vkGetPhysicalDeviceFormatProperties2`| **Yes** | No | `checkFormatProperties` | **Hook.** Same as the non-`2` version; fakes support for compressed formats. |
+|`vkGetPhysicalDeviceImageFormatProperties2`| **Yes**| No | `getCompressedImageFormatProperties` | **Hook.** Same as the non-`2` version; fakes support for compressed formats. |
+|`vkGetPhysicalDeviceQueueFamilyProperties2`|**No**|No||Standard pass-through. |
+|`vkGetPhysicalDeviceMemoryProperties2`|**Yes**|No|`overrideMemoryHeapSize`| **Hook.** Same as the non-`2` version; modifies reported heap sizes. |
+|`vkGetPhysicalDeviceSparseImageFormatProperties2`|**No**|No||Standard pass-through. |
+| `vkCmdPushDescriptorSetKHR`| **No** | No | | Standard pass-through. |
+| `vkTrimCommandPool` | **No** | No | | Standard pass-through. |
+|`vkGetPhysicalDeviceExternalBufferProperties`|**No**|No||Standard pass-through. |
+| `vkGetMemoryFdKHR` | **Yes** | N/A (dispatch is separate)| `sendmsg` | **IPC Hook.** Sends the acquired file descriptor over a socket instead of returning it directly. |
+|`vkGetPhysicalDeviceExternalSemaphoreProperties`|**No**|No||Standard pass-through. |
+| `vkGetSemaphoreFdKHR` | **Yes** | N/A (dispatch is separate)| `sendmsg` | **IPC Hook.** Sends the acquired file descriptor over a socket. |
+|`vkGetPhysicalDeviceExternalFenceProperties`|**No**|No||Standard pass-through. |
+| `vkGetFenceFdKHR` | **Yes** | N/A (dispatch is separate)| `sendmsg` | **IPC Hook.** Sends the acquired file descriptor over a socket. |
+| `vkEnumeratePhysicalDeviceGroups`| **No** | No | | Standard pass-through. |
+|`vkGetDeviceGroupPeerMemoryFeatures`| **No** | No | | Standard pass-through. |
+| `vkBindBufferMemory2` | **Yes** | No | `TextureDecoder_addBoundBuffer` | **Hook.** Same as the non-`2` version; registers the binding with the texture decoder. |
+| `vkBindImageMemory2` | **No** | No | | Standard pass-through. |
+| `vkCmdSetDeviceMask` | **No** | No | | Standard pass-through. |
+| `vkAcquireNextImage2KHR` | **Yes** | N/A (dispatch bypassed)| `XWindowSwapchain_acquireNextImage` | **Hook.** Same as the non-`2` version; acquires an image from the custom swapchain. |
+| `vkCmdDispatchBase` | **No** | No | | Standard pass-through. |
+| `vkCreateDescriptorUpdateTemplate`| **No** | No | | Not implemented in binary. |
+| `vkDestroyDescriptorUpdateTemplate`| **No** | No | | Not implemented in binary. |
+|`vkUpdateDescriptorSetWithTemplate`|**No**|No||Not implemented in binary. |
+| `vkGetDescriptorSetLayoutSupport`| **No** | No | | Standard pass-through. |
+|`vkGetPhysicalDeviceCalibrateableTimeDomainsKHR`|**No**|No||Standard pass-through. |
+|`vkGetCalibratedTimestampsKHR`| **No** | No | | Standard pass-through. |
+| `vkCreateRenderPass2` | **Yes** | No | | **Soft Hook.** Contains custom logic to correctly deserialize specific `pNext` extension structs, like `VkAttachmentSampleCountInfoAMD/NV`. |
+| `vkCmdBeginRenderPass2` | **Yes** | No | | **Soft Hook.** Contains custom logic to correctly deserialize `pNext` extension structs like `VkDeviceGroupRenderPassBeginInfo`. |
+| `vkCmdNextSubpass2` | **No** | No | | Standard pass-through. |
+| `vkCmdEndRenderPass2` | **No** | No | | Standard pass-through. |
+|`vkGetSemaphoreCounterValue`| **No** | No | | Standard pass-through. |
+| `vkWaitSemaphores` | **Yes** | N/A (dispatch is async)| `TimelineSemaphore_asyncWait` | **Major Hook.** Replaces the blocking call with an asynchronous, non-stalling implementation using a worker thread and `eventfd`. |
+| `vkSignalSemaphore` | **No** | No | | Standard pass-through. |
+| `vkGetDeviceBufferMemoryRequirements`| **No** | No | | Standard pass-through. |
+|`vkGetDeviceImageMemoryRequirements`| **No** | No | | Standard pass-through. |
+|`vkGetDeviceImageSparseMemoryRequirements`|**No**|No||Standard pass-through. |
+| `vkCreateSamplerYcbcrConversion`| **No** | No | | Standard pass-through. |
+|`vkDestroySamplerYcbcrConversion`| **No** | No | | Standard pass-through. |
+| `vkGetDeviceQueue2` | **No** | No | | Standard pass-through. |
+|`vkCmdDrawIndirectCount` | **No** | No | | Standard pass-through. |
+|`vkCmdDrawIndexedIndirectCount`| **No** | No | | Standard pass-through. |
+|`vkCmdBindTransformFeedbackBuffersEXT`| **No** | No | | Standard pass-through. |
+|`vkCmdBeginTransformFeedbackEXT`| **No** | No | | Standard pass-through. |
+|`vkCmdEndTransformFeedbackEXT`| **No** | No | | Standard pass-through. |
+|`vkCmdBeginQueryIndexedEXT` | **No** | No | | Standard pass-through. |
+|`vkCmdEndQueryIndexedEXT` | **No** | No | | Standard pass-through. |
+|`vkCmdDrawIndirectByteCountEXT`| **No** | No | | Standard pass-through. |
+|`vkGetBufferOpaqueCaptureAddress`| **No** | No | | Standard pass-through. |
+|`vkGetBufferDeviceAddress`| **No** | No | | Standard pass-through. |
+|`vkGetDeviceMemoryOpaqueCaptureAddress`| **Yes** | No | | **Minor Hook.** Resolves the real `VkDeviceMemory` handle from a custom wrapper object before calling the driver. |
+|`vkCmdSetLineStippleKHR` | **No** | No | | Renamed to `...EXT` in later versions, but is a standard pass-through. |
+|`vkCmdSetCullMode` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetFrontFace` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetPrimitiveTopology`| **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetViewportWithCount`| **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetScissorWithCount`| **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdBindVertexBuffers2` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetDepthTestEnable` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetDepthWriteEnable` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetDepthCompareOp` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetDepthBoundsTestEnable` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetStencilTestEnable` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetStencilOp` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetRasterizerDiscardEnable`| **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetDepthBiasEnable` | **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetPrimitiveRestartEnable`| **No** | No | | (Dynamic State v2) Standard pass-through. |
+|`vkCmdSetTessellationDomainOriginEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetDepthClampEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetPolygonModeEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetRasterizationSamplesEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetSampleMaskEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetAlphaToCoverageEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetAlphaToOneEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetLogicOpEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetColorBlendEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetColorBlendEquationEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetColorWriteMaskEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetRasterizationStreamEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetConservativeRasterizationModeEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetExtraPrimitiveOverestimationSizeEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetDepthClipEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetSampleLocationsEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetColorBlendAdvancedEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetProvokingVertexModeEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetLineRasterizationModeEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetLineStippleEnableEXT`|**No**|No||Standard pass-through. |
+|`vkCmdSetDepthClipNegativeOneToOneEXT`|**No**|No||Standard pass-through. |
+|`vkCmdCopyBuffer2KHR`|**No**|No||(Alias for `vkCmdCopyBuffer2`) Standard pass-through. |
+|`vkCmdCopyImage2KHR`|**No**|No||(Alias for `vkCmdCopyImage2`) Standard pass-through. |
+|`vkCmdBlitImage2KHR`|**No**|No||(Alias for `vkCmdBlitImage2`) Standard pass-through. |
+|`vkCmdCopyBufferToImage2KHR`|**Yes**|N/A (dispatch may be bypassed)|`TextureDecoder_containsImage`, `TextureDecoder_copyBufferToImage`|**Hook.** (Alias for `vkCmdCopyBufferToImage2`) Intercepts the call to handle texture decompression. |
+|`vkCmdCopyImageToBuffer2KHR`|**No**|No||(Alias for `vkCmdCopyImageToBuffer2`) Standard pass-through. |
+|`vkCmdResolveImage2KHR`|**No**|No||(Alias for `vkCmdResolveImage2`) Standard pass-through. |
+|`vkCmdSetEvent2KHR`|**No**|No||(Alias for `vkCmdSetEvent2`) Standard pass-through. |
+|`vkCmdResetEvent2KHR`|**No**|No||(Alias for `vkCmdResetEvent2`) Standard pass-through. |
+|`vkCmdWaitEvents2KHR`|**No**|No||(Alias for `vkCmdWaitEvents2`) Standard pass-through. |
+|`vkCmdPipelineBarrier2KHR`|**No**|No||(Alias for `vkCmdPipelineBarrier2`) Standard pass-through. |
+|`vkQueueSubmit2KHR`|**Yes**|No|`TextureDecoder_decodeAll`|**Hook.** (Alias for `vkQueueSubmit2`) Ensures texture decompression is complete before submission. |
+|`vkCmdWriteTimestamp2KHR`|**No**|No||(Alias for `vkCmdWriteTimestamp2`) Standard pass-through. |
+|`vkCmdBeginRenderingKHR`|**Yes**|No|`TextureDecoder_containsImage`|**Hook.** (Alias for `vkCmdBeginRendering`) Replaces image views for emulated textures with their backing storage views. |
+|`vkCmdEndRenderingKHR`|**No**|No||(Alias for `vkCmdEndRendering`) Standard pass-through. |
+|`vkGetSemaphoreCounterValueKHR`|**No**|No||(Alias for `vkGetSemaphoreCounterValue`) Standard pass-through. |
+|`vkWaitSemaphoresKHR`|**Yes**|N/A (dispatch is async)|`TimelineSemaphore_asyncWait`|**Major Hook.** (Alias for `vkWaitSemaphores`) Replaces the blocking call with an asynchronous implementation. |
+|`vkSignalSemaphoreKHR`|**No**|No||(Alias for `vkSignalSemaphore`) Standard pass-through. |
 
 ### 1. `vt_handle_vkDestroyDevice`
 
@@ -726,8 +984,6 @@ void vt_handle_vkFlushMappedMemoryRanges(VtContext* context) {
 }
 ```
 
-Of course. Here is a comprehensive decompilation and analysis of the next 10 Vulkan command handlers from `libvortekrenderer2.so`.
-
 ### 1. `vt_handle_vkInvalidateMappedMemoryRanges`
 
 **Purpose:**
@@ -1297,8 +1553,6 @@ void vt_handle_vkDestroyFence(VtContext* context) {
 }
 ```
 
-Of course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan command handlers from `libvortekrenderer2.so`.
-
 ### 1. `vt_handle_vkResetFences`
 
 **Purpose:**
@@ -1825,8 +2079,6 @@ void vt_handle_vkDestroyImage(VtContext* context) {
 }
 ```
 
-Of course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan command handlers.
-
 ---
 
 ### 1. `vt_handle_vkGetImageSubresourceLayout`
@@ -2078,8 +2330,6 @@ void vt_handle_vkCreateComputePipelines(VtContext* context) {
 Restart
 
 ---
-
-Of course. Here is a comprehensive decompilation and analysis of the 20 requested Vulkan wrapper functions from `libvortekrenderer2.so`.
 
 ### Overall Architecture
 
@@ -2449,8 +2699,6 @@ void vt_handle_vkCreatePipelineLayout(VtContext* context) {
 
 ---
 
-Of course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan wrapper functions.
-
 ### Overall Architecture (Recap)
 
 These functions continue to follow the established architectural pattern:
@@ -2804,8 +3052,6 @@ void vt_handle_vkCmdSetScissor(VtContext* context) {
 
 ---
 
-Of course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan wrapper functions from `libvortekrenderer2.so`, focusing on any modifications or unusual behavior.
-
 ### Summary of Modifications
 
 | Function | Modification Detected? | Summary of Modification |
@@ -3058,8 +3304,6 @@ void vt_handle_vkCmdCopyBufferToImage(VtContext* context) {
 restart
 
 ---
-
-Of course. Here is a comprehensive decompilation and analysis for the next 20 functions, from `vt_handle_vkCmdSetLineWidth` to `vt_handle_vkCmdCopyBufferToImage`.
 
 ### Summary of Modifications
 
@@ -3437,8 +3681,6 @@ void vt_handle_vkCmdCopyBufferToImage(VtContext* context) {
 4.  If the destination image is *not* an emulated one, it proceeds as a normal pass-through call to the Vulkan driver. This ensures standard functionality is unaffected.
 
 ---
-
-Of course. Here is a comprehensive decompilation and analysis of the next 20 functions from `libvortekrenderer2.so`, with a focus on identifying any modifications or unusual behavior.
 
 ### Summary of Modifications
 
@@ -3845,8 +4087,6 @@ void vt_handle_vkCmdBeginRenderPass(VtContext* context) {
 
 ---
 
-Of course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan wrapper functions from `libvortekrenderer2.so`.
-
 ### Summary of Modifications
 
 | Function | Modification Detected? | Summary of Modification |
@@ -4186,8 +4426,6 @@ void vt_handle_vkBindBufferMemory2(VtContext* context) {
 *   `vkAcquireNextImage2KHR` is **modified** as part of the custom swapchain implementation, just like its predecessor.
 
 ---
-
-Excellent. Here is the comprehensive decompilation and analysis for the next set of 20 Vulkan functions from `libvortekrenderer2.so`.
 
 ### Summary of Modifications
 
@@ -4530,8 +4768,6 @@ void vt_handle_vkWaitSemaphores(VtContext* context, int client_socket_fd) {
 **Conclusion:** **Significant modification detected.** Replaces a blocking API call with a non-blocking asynchronous implementation using a worker thread and an `eventfd`.
 
 ---
-
-Of course. Here is a comprehensive decompilation and analysis of the next 20 functions, focusing on deserialization, modifications, and serialization.
 
 ### Summary of Modifications
 
@@ -4907,7 +5143,7 @@ void vt_handle_vkCmdBindVertexBuffers2(VtContext* context) {
     }
 }
 ```
-**Analysis:** This is the newer, more flexible version of `vkCmdBindVertexBuffers`. LikOf course. Here is a comprehensive decompilation and analysis of the next 20 Vulkan wrapper functions from `libvortekrenderer2.so`, focusing on any custom modifications.
+**Analysis:** This is the newer, more flexible version of `vkCmdBindVertexBuffers`. Lik
 
 ### Overall Analysis of the Function Batch
 
@@ -5411,8 +5647,6 @@ void vt_handle_vkCmdSetColorWriteMaskEXT(VtContext* context) {
 
 ---
 
-Of course. Here is a comprehensive decompilation and analysis of the next 15 Vulkan wrapper functions.
-
 ### Summary of Modifications
 
 This batch of functions primarily consists of Vulkan commands (`vkCmd...`). Most are simple state-setting functions which are passed through to the driver without modification. The more complex `...2KHR` style commands are also passed through directly, with the exception of `vkCmdCopyBufferToImage2`, which is hooked to support the `TextureDecoder`'s format emulation.
@@ -5685,8 +5919,6 @@ void vt_handle_vkCmdCopyImageToBuffer2(VtContext* context) {
 **Analysis:** This function is a standard pass-through. Unlike its buffer-to-image counterpart, it does **not** check if the `srcImage` is managed by the `TextureDecoder`. This implies that reading data *from* an emulated compressed texture via this command is either not supported or not necessary for the renderer's architecture. The most likely reason is that the emulated textures are write-only targets for asset loading, and any subsequent reads are expected to happen within shaders where sampling logic can be properly controlled.
 
 ---
-
-Here is a comprehensive decompilation and analysis of the next 12 Vulkan wrapper functions from `libvortekrenderer2.so`.
 
 ### Summary of Modifications
 
